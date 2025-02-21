@@ -1,0 +1,999 @@
+---
+title: "Messy Data Group Project"
+output:
+  pdf_document: default
+  html_document: default
+  error: TRUE
+date: "2024-04-25"
+
+---
+
+Brief introduction to this project:
+
+New York City (NYC) is a densely populated urban environment and as such, the buildings in
+the city have extraordinary energy consumption. As the number of building constructions shoots
+up in the city, so does the energy consumption. Our project is an attempt to understand this
+consumption in buildings and the various factors, such as location and property type, that impact
+it. The project is divided into three main parts. In the first part we will discuss the effectiveness
+of energy efficiency measures in different property types in the city. In the second part, we will
+focus on the influence of various building characteristics on energy consumption patterns in the
+city. Understanding these two things will help in finding the drivers of high energy consumption
+and potentially set us up to understand sustainability efforts better. Lastly, we will generate
+predictions for average greenhouse gas emissions in buildings that are currently under
+construction in NYC. This is important to understand the environmental impact of constructions
+currently underway.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The following packages need to be loaded to run this project.
+
+```{r}
+library(tidyverse)
+library(pROC)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(vip)
+library(ggmap)
+library(dplyr)
+library(animation)
+library(httr)
+library(randomForest)
+library(e1071)
+library(ranger)
+library(ggalt)
+library(tigris)
+library(caret)
+
+nyc_buildings <- read_csv("NYC_Building_Energy_and_Water_Data_Disclosure_for_Local_Law_84__2023-Present__20240411.csv")
+```
+
+Effectiveness of Energy Efficiency Measures
+1. How do different types of properties vary in their energy efficiency, as indicated by metrics like ENERGY STAR Score and State EUI?
+
+```{r}
+# 1.1 Data cleaning
+
+# selecting some variables for analysis 
+mod_var <- nyc_buildings %>% 
+  select(`Primary Property Type - Portfolio Manager-Calculated`, `Largest Property Use Type - Gross Floor Area (ft²)`, `Year Built`, `Occupancy`, `Number of Buildings`, `ENERGY STAR Score`, `Weather Normalized Site Energy Use (kBtu)`, `Weather Normalized Site EUI (kBtu/ft²)`, Latitude, Longitude)
+
+# changing the name of the variables for ease in use
+mod_var <- mod_var %>% 
+  rename(property_type = `Primary Property Type - Portfolio Manager-Calculated`,
+         large_property_gross = `Largest Property Use Type - Gross Floor Area (ft²)`,
+         year_built = `Year Built`,
+         occupancy = Occupancy,
+         number_of_buildings = `Number of Buildings`,
+         energy_star_score = `ENERGY STAR Score`,
+         weather_normalized_energy_use = `Weather Normalized Site Energy Use (kBtu)`,
+         weather_normalized_per_feet = `Weather Normalized Site EUI (kBtu/ft²)`,
+         latitude = Latitude,
+         longitude = Longitude)
+
+# setting a standardized property type
+mod_var <- mod_var %>%
+  mutate(property_type = case_when(
+    property_type %in% c('Multifamily Housing', 'Other - Lodging/Residential', 
+                         'Residence Hall/Dormitory', 'Single-Family Home') ~ 'Residential',
+    property_type == 'Office' ~ 'Office Buildings',
+    property_type %in% c('Adult Education', 'College/University', 'K-12 School',
+                         'Data Center', 'Laboratory', 'Other - Education', 'Pre-school/Daycare',
+                         'Vocational School') ~ 'Educational Facilities',
+    property_type %in% c('Ambulatory Surgical Center', 'Hospital (General Medical & Surgical)',
+                         'Medical Office', 'Other - Specialty Hospital', 
+                         'Outpatient Rehabilitation/Physical Therapy',
+                         'Urgent Care/Clinic/Other Outpatient', 'Veterinary Office') ~ 'Hospitals and Health Facilities',
+    property_type %in% c('Automobile Dealership', 'Bank Branch', 'Enclosed Mall', 
+                         'Food Sales', 'Food Service', 'Other - Mall', 'Other - Recreation', 
+                         'Other - Restaurant/Bar', 'Residential Care Facility', 'Restaurant',
+                         'Repair Services (Vehicle, Shoe, Locksmith, etc.)', 'Retail Store', 
+                         'Strip Mall', 'Supermarket/Grocery Store', 'Wholesale Club/Supercenter') ~ 'Store Buildings',
+    property_type %in% c('Bar/Nightclub', 'Bowling Alley', 'Convention Center', 'Ice/Curling Rink',
+                         'Fitness Center/Health Club/Gym', 'Library', 'Lifestyle Center', 'Movie Theater', 
+                         'Museum', 'Other - Entertainment/Public Assembly', 'Performing Arts', 
+                         'Senior Living Community', 'Social/Meeting Hall', 
+                         'Personal Services (Health/Beauty, Dry Cleaning, etc.)') ~ 'Indoor Public Assembly Cultural Facilities',
+    property_type %in% c('Mailing Center/Post Office', 'Other', 'Mixed Use Property', 'Other - Utility',
+                         'Prison/Incarceration', 'Parking') ~ 'Misc Building Classifications',
+    property_type %in% c('Distribution Center', 'Non-Refrigerated Warehouse', 
+                         'Refrigerated Warehouse', 'Self-Storage Facility') ~ 'Warehouse',
+    property_type %in% c('Courthouse', 'Financial Office', 'Fire Station',   
+                         'Other - Public Services', 'Other - Services', 'Police Station') ~ 'Government City Departments',
+    property_type == 'Hotel' ~ 'Hotel',
+    property_type %in% c('Manufacturing/Industrial Plant', 'Other - Technology/Science', 
+                         'Wastewater Treatment Plant') ~ 'Factories and Industrial Buildings',
+    property_type %in% c('Stadium (Open)', 'Zoo') ~ 'Outdoor Recreational Facilities',
+    property_type == 'Transportation Terminal/Station' ~ 'Transportation',
+    property_type == 'Worship Facility' ~ 'Religious Facilities')
+    ) 
+
+# removing any variables that are not number from energy_star_score and 
+# weather_normalized_energy_use
+mod_var <- mod_var %>% 
+  mutate(energy_star_score = ifelse(energy_star_score == "Not Available", NA, energy_star_score),
+         weather_normalized_energy_use = ifelse(weather_normalized_energy_use == "Not Available", NA, weather_normalized_energy_use),
+         weather_normalized_per_feet = ifelse(weather_normalized_per_feet == "Not Available", NA, weather_normalized_per_feet),
+         latitude = ifelse(latitude == "Not Available", NA, latitude),
+         longitude = ifelse(longitude == "Not Available", NA, longitude))
+
+# changing the character variables to factor or numerical (property_type, 
+# metered_areas_energy, metered_areas_water, energy_star_score, 
+# weather_normalized_energy_use)
+mod_var <- mod_var %>% 
+  mutate(property_type = factor(property_type, ordered = FALSE),
+         energy_star_score = as.numeric(energy_star_score),
+         weather_normalized_energy_use = as.numeric(weather_normalized_energy_use),
+         weather_normalized_per_feet = as.numeric(weather_normalized_per_feet))
+
+# removing all the NAs
+mod_var <- na.omit(mod_var)
+
+```
+
+Comparing different kinds of model and see what is the best model to make
+predictions
+
+Running a logistic regression at first. Taking energy_star_score as the outcome
+variable. Since the nationsal median energy star score is 50, dividing the energy
+star score into binary values with scores more than 50 into 1 and less than 50 as
+0.
+
+```{r}
+# separating the train and test according to the median age of the buildings
+mod_var <- mod_var %>% 
+  mutate(high_efficiency = ifelse(energy_star_score >= 75, 1, 0))
+
+year_median <- median(mod_var$year_built)
+train <- mod_var %>% 
+  filter(year_built <= year_median)
+test <- mod_var %>% 
+  filter(year_built > year_median)
+
+# the log regression
+log_model <- glm(high_efficiency ~ property_type + year_built + occupancy, data = train, family = "binomial")
+
+# making predictions
+test$predicted_scores <- predict(log_model, test, type = "response")
+test$predicted_class <- ifelse(test$predicted_scores >= 0.5, 1, 0)
+confusion_matrix <- table(test$high_efficiency, test$predicted_class)
+
+accuracy_from_matrix <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+
+log_roc <- roc(test$high_efficiency, test$predicted_scores)  # ROC curve
+auc(log_roc)
+
+# calculating the ROC object
+roc_data <- data.frame(
+  FPR = log_roc$specificities,
+  TPR = log_roc$sensitivities,
+  cutoffs = log_roc$thresholds
+)
+
+# Plot the ROC curve using ggplot2
+ggplot(roc_data, aes(x = FPR, y = TPR)) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(title = "ROC Curve for Logistic Regression Model",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_minimal() +
+  annotate("text", x = 0.5, y = 0.25, label = paste("AUC =", round(auc(log_roc), 2)), color = "red", size = 5)
+
+# Calculate accuracy for each property type
+accuracy_by_property <- test %>%
+  group_by(property_type) %>%
+  summarise(Accuracy = mean(predicted_class == high_efficiency),
+            Count = n()) %>%
+  filter(Count > 30) 
+
+# Plot accuracy by property type
+ggplot(accuracy_by_property, aes(x = property_type, y = Accuracy, fill = property_type)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Model Accuracy by Property Type",
+       x = "Property Type",
+       y = "Accuracy") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+Running a random forest regression
+
+```{r}
+# train the Random Forest model
+rf_model_score <- randomForest(energy_star_score ~ property_type + year_built + occupancy, 
+                               data = train, ntree = 1000)
+
+# make predictions on the test set and evaluate the model as well
+test$predicted_scores_rf = predict(rf_model_score, test)
+rmse <- sqrt(mean((test$predicted_scores_rf - test$energy_star_score)^2))
+
+rmse_rf <- sqrt(mean((test$predicted_scores_rf - test$energy_star_score)^2))
+print(paste("RMSE for Random Forest Regression:", rmse_rf))
+
+test <- test %>%
+  mutate(
+    actual_bin = cut(energy_star_score, breaks = seq(0, 100, by = 20), include.lowest = TRUE, labels = c("0-20", "21-40", "41-60", "61-80", "81-100")),
+    predicted_bin = cut(predicted_scores_rf, breaks = seq(0, 100, by = 20), include.lowest = TRUE, labels = c("0-20", "21-40", "41-60", "61-80", "81-100")))
+
+# Calculate precision for each actual bin
+precision_data <- test %>%
+  group_by(actual_bin) %>%
+  summarise(
+    Precision = mean(predicted_bin == actual_bin),
+    .groups = 'drop'
+  )
+
+# Plot the precision for each bin
+ggplot(precision_data, aes(x = actual_bin, y = Precision, fill = actual_bin)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Precision of Predicted ENERGY STAR Scores by Bin",
+       x = "Actual ENERGY STAR Score Bin",
+       y = "Precision") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Blues") +
+  theme(legend.position = "none")
+
+# Evaluate accuracy for each property type
+accuracy_by_property_rf <- test %>%
+  mutate(error = abs(predicted_scores_rf - energy_star_score)) %>%
+  group_by(property_type) %>%
+  summarise(Mean_Absolute_Error = mean(error),
+            Count = n()) %>%
+  filter(Count > 30)
+
+# Plot Mean Absolute Error by property type
+ggplot(accuracy_by_property_rf, aes(x = property_type, y = Mean_Absolute_Error, fill = property_type)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Mean Absolute Error of RF Predictions by Property Type",
+       x = "Property Type",
+       y = "Mean Absolute Error") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+```
+Correlation Analysis between the age and the energy star score
+
+```{r}
+mod_var %>% 
+  summarise(Correlation = cor(year_built, energy_star_score, use = "complete.obs")) %>% 
+  print()
+
+# plotting the relationship
+ggplot(mod_var, aes(x = year_built, y = energy_star_score)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Correlation between Year Built and ENERGY STAR Score",
+       x = "Year Built",
+       y = "ENERGY STAR Score") +
+  theme_minimal()
+
+# plotting the high efficiency of logistic model and the age
+test$predicted_high_efficiency <- ifelse(test$predicted_scores >= 0.5, 1, 0)
+
+proportion_high_efficiency_by_year <- test %>%
+  group_by(year_built) %>%
+  summarise(Proportion_High_Efficiency = mean(predicted_high_efficiency == 1, na.rm = TRUE))
+
+ggplot(proportion_high_efficiency_by_year, aes(x = year_built, y = Proportion_High_Efficiency)) +
+  geom_line() +
+  labs(title = "Proportion of High Efficiency by Year Built",
+       x = "Year Built",
+       y = "Proportion High Efficiency") +
+  theme_minimal()
+
+# creating a new variable for binned years
+test <- test %>%
+  mutate(year_built_bin = cut(year_built, breaks = seq(1940, 2020, by = 10), labels = seq(1940, 2010, by = 10))) %>% 
+  na.omit()
+
+# calcualte average predicted scores for each bin
+avg_scores_by_decade <- test %>%
+  group_by(year_built_bin) %>%
+  summarise(avg_predicted_score = mean(predicted_scores_rf, na.rm = TRUE))
+
+
+ggplot(avg_scores_by_decade, aes(x = year_built_bin, y = avg_predicted_score, group = 1)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Average Predicted ENERGY STAR Scores by Decade",
+       x = "Decade",
+       y = "Average Predicted Score") +
+  theme_minimal()
+```
+
+Spatial Analysis
+
+```{r}
+NYCMap <- get_map(location = 'New York City', zoom = 10, maptype = 'terrain')
+
+# Plot the map with predictions
+ggmap(NYCMap) +
+  geom_point(data = test, aes(x = longitude, y = latitude, color = predicted_scores), alpha = 0.6, size = 1) +
+  geom_point(data = test, aes(x = longitude, y = latitude, color = energy_star_score), alpha = 0.6, size = 1, shape = 2) +
+  scale_color_gradient(low = "blue", high = "red", name = "Scores") +
+  labs(title = "Predicted vs. Actual Building Energy Efficiency in NYC",
+       subtitle = "Blue-Red Gradient: Low to High Scores") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+Random forest model
+
+```{r}
+ggmap(NYCMap) +
+  geom_point(data = test, aes(x = longitude, y = latitude, color = predicted_scores_rf), alpha = 0.6, size = 1) +
+  scale_color_gradient(low = "lightblue", high = "green4", name = "Predicted Energy Star Score") +
+  labs(title = "Predicted Building Energy Star Scores in NYC",
+       subtitle = paste("Model RMSE:", round(rmse, 2))) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+## Research Question 2: Impact of Building Characteristics to Energy Usage ##
+## 2.1 data cleaning##
+```{r}
+ characteristic_of_building <- nyc_buildings %>%
+  select(`Primary Property Type - Portfolio Manager-Calculated`, `Year Built`, `Construction Status`, 
+         `Number of Buildings`, `Occupancy`, `Weather Normalized Site EUI (kBtu/ft²)`, `Natural Gas - Weather Normalized Site Natural Gas Intensity (therms/ft²)`, `Electricity - Weather Normalized Site Electricity Intensity (Grid and Onsite Renewables) (kWh/ft²)`,
+         `Borough`) %>%
+  select(-`Construction Status`) %>%
+  rename(borough = `Borough`,
+         property_type = `Primary Property Type - Portfolio Manager-Calculated`,
+         age = `Year Built`,
+         number_of_buildings = `Number of Buildings`,
+         occupancy = `Occupancy`,
+         energy_use = `Weather Normalized Site EUI (kBtu/ft²)`,
+         natural_gas = `Natural Gas - Weather Normalized Site Natural Gas Intensity (therms/ft²)`,
+         electricity = `Electricity - Weather Normalized Site Electricity Intensity (Grid and Onsite Renewables) (kWh/ft²)`)
+
+characteristic_of_building <- characteristic_of_building %>%
+  mutate(age = 2024 - as.numeric(age)) %>% ## year to age
+  filter(energy_use != "") %>%
+  filter(natural_gas != "")  %>%
+  filter(electricity != "") %>%
+  mutate(occupancy = as.numeric(occupancy/100),
+         number_of_buildings = as.numeric(number_of_buildings),
+         energy_use = as.numeric(energy_use),
+         natural_gas = as.numeric(natural_gas),
+         electricity = as.numeric(electricity)
+  )
+  
+characteristic_of_building <- characteristic_of_building %>%
+  filter(energy_use != "Not Available") %>%
+  filter(natural_gas != "Not Available") %>%
+  filter(electricity != "Not Available") 
+  
+
+characteristic_of_building <- characteristic_of_building %>%
+  mutate(property_type = case_when(
+    property_type %in% c('Multifamily Housing', 'Other - Lodging/Residential', 
+                         'Residence Hall/Dormitory', 'Single-Family Home') ~ 'Residential',
+    property_type == 'Office' ~ 'Office Buildings',
+    property_type %in% c('Adult Education', 'College/University', 'K-12 School',
+                         'Data Center', 'Laboratory', 'Other - Education', 'Pre-school/Daycare',
+                         'Vocational School') ~ 'Educational Facilities',
+    property_type %in% c('Ambulatory Surgical Center', 'Hospital (General Medical & Surgical)',
+                         'Medical Office', 'Other - Specialty Hospital', 
+                         'Outpatient Rehabilitation/Physical Therapy',
+                         'Urgent Care/Clinic/Other Outpatient', 'Veterinary Office') ~ 'Hospitals and Health Facilities',
+    property_type %in% c('Automobile Dealership', 'Bank Branch', 'Enclosed Mall', 
+                         'Food Sales', 'Food Service', 'Other - Mall', 'Other - Recreation', 
+                         'Other - Restaurant/Bar', 'Residential Care Facility', 'Restaurant',
+                         'Repair Services (Vehicle, Shoe, Locksmith, etc.)', 'Retail Store', 
+                         'Strip Mall', 'Supermarket/Grocery Store', 'Wholesale Club/Supercenter') ~ 'Store Buildings',
+    property_type %in% c('Bar/Nightclub', 'Bowling Alley', 'Convention Center', 'Ice/Curling Rink',
+                         'Fitness Center/Health Club/Gym', 'Library', 'Lifestyle Center', 'Movie Theater', 
+                         'Museum', 'Other - Entertainment/Public Assembly', 'Performing Arts', 
+                         'Senior Living Community', 'Social/Meeting Hall', 
+                         'Personal Services (Health/Beauty, Dry Cleaning, etc.)') ~ 'Indoor Public Assembly Cultural Facilities',
+    property_type %in% c('Mailing Center/Post Office', 'Other', 'Mixed Use Property', 'Other - Utility',
+                         'Prison/Incarceration', 'Parking') ~ 'Misc Building Classifications',
+    property_type %in% c('Distribution Center', 'Non-Refrigerated Warehouse', 
+                         'Refrigerated Warehouse', 'Self-Storage Facility') ~ 'Warehouse',
+    property_type %in% c('Courthouse', 'Financial Office', 'Fire Station',   
+                         'Other - Public Services', 'Other - Services', 'Police Station') ~ 'Government City Departments',
+    property_type == 'Hotel' ~ 'Hotel',
+    property_type %in% c('Manufacturing/Industrial Plant', 'Other - Technology/Science', 
+                         'Wastewater Treatment Plant') ~ 'Factories and Industrial Buildings',
+    property_type %in% c('Stadium (Open)', 'Zoo') ~ 'Outdoor Recreational Facilities',
+    property_type == 'Transportation Terminal/Station' ~ 'Transportation',
+    property_type == 'Worship Facility' ~ 'Religious Facilities')
+    )
+
+characteristic_of_building <- characteristic_of_building %>%
+  mutate(borough = case_when(
+    borough == "BRONX" ~ "Bronx",
+    borough == "BROOKLYN" ~ "Brooklyn",
+    borough == "MANHATTAN" ~ "Manhattan",
+    borough == "QUEENS" ~ "Queens",
+    borough == "STATEN IS" ~ "Staten Island",  
+    )) %>%
+  mutate(borough = ifelse(borough == "", NA, borough)) %>%
+  filter(!is.na(borough))
+```
+
+## 2.2 Decision Tree Model ##
+
+```{r}
+set.seed(123)
+
+## 2.2.1 natural gas ##
+## classification decision tree model ##
+
+natural_gas <- characteristic_of_building %>%
+  select(-energy_use, -electricity) %>%
+  mutate(category = case_when(
+    natural_gas == 0 ~ "No use",
+    natural_gas > 0 & natural_gas <= 0.3 ~ "Extreme Low",
+    natural_gas > 0.3 & natural_gas <= 0.6 ~ "Low",
+    natural_gas > 0.6 & natural_gas <= 1 ~ "Medium",
+    natural_gas > 1 & natural_gas <= 5 ~ "Slightly High",
+    natural_gas > 5 ~ "Extreme High"))
+
+
+natural_gas$borough <- as.factor(natural_gas$borough)
+natural_gas$property_type <- as.factor(natural_gas$property_type)
+natural_gas$category <- as.factor(natural_gas$category)
+
+indices <- sample(1:nrow(natural_gas), size = 0.7 * nrow(natural_gas))
+train_ng <- natural_gas[indices, ]
+test_ng <- natural_gas[-indices, ]
+
+tree_ng <- rpart(category ~ property_type + age + number_of_buildings + occupancy + borough, 
+                    data = train_ng, method = "class")
+
+tree_plot_ng <- rpart.plot(tree_ng, box.palette="Greens")
+
+
+## Model Evaluation ##
+ng_predictions <- predict(tree_ng, test_ng, type = "class")
+ng_confusionMatrix <- table(Predicted = ng_predictions, Actual = test_ng$category)
+ng_accuracy <- sum(diag(ng_confusionMatrix)) / sum(ng_confusionMatrix)
+
+##Understanding the Important Variables##
+var_importance_ng <- vip::vip(tree_ng, num_features = 5)
+print(var_importance_ng)
+
+```
+
+
+
+```{r}
+set.seed(123)
+
+sub_natural_gas <- natural_gas %>%
+  filter(category %in% c("High", "Slightly High", "Extreme High"))
+
+
+sub_natural_gas <- sub_natural_gas %>%
+  mutate(category = case_when(
+    natural_gas >1 & natural_gas <= 5 ~ "1-5",
+    natural_gas > 5 & natural_gas <= 50 ~ "5-50",
+    natural_gas > 50 ~ ">50"))
+
+sub_natural_gas$borough <- as.factor(sub_natural_gas$borough)
+sub_natural_gas$property_type <- as.factor(sub_natural_gas$property_type)
+sub_natural_gas$category <- as.factor(sub_natural_gas$category)
+
+sub_indices <- sample(1:nrow(sub_natural_gas), size = 0.7 * nrow(sub_natural_gas))
+train_sub_ng <- sub_natural_gas[sub_indices, ]
+test_sub_ng <- sub_natural_gas[-sub_indices, ]
+
+tree_sub_ng <- rpart(category ~ property_type + age + number_of_buildings + occupancy + borough, 
+                    data = train_sub_ng, method = "class")
+
+tree_plot_sub_ng <- rpart.plot(tree_sub_ng, box.palette="Blue")
+
+## Model Evaluation ##
+sub_ng_predictions <- predict(tree_sub_ng, test_sub_ng, type = "class")
+sub_ng_confusionMatrix <- table(Predicted = sub_ng_predictions, Actual = test_sub_ng$category)
+sub_ng_accuracy <- sum(diag(sub_ng_confusionMatrix)) / sum(sub_ng_confusionMatrix)
+
+##Understanding the Important Variables##
+var_importance_sub_ng <- vip::vip(tree_sub_ng, num_features = 5)
+print(var_importance_sub_ng)
+```
+
+
+```{r}
+## look into natural_gas = 0 ##
+
+top5_property_no_natural_gas <- natural_gas %>%
+  filter(natural_gas == 0) %>%
+  group_by(property_type) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  head(5)
+ 
+## percent: property type(natural_gas = 0) / property_type
+total_count <- natural_gas %>%
+  group_by(property_type) %>%
+  summarize(total_count = n())
+
+no_use_of_natural_gas <- natural_gas %>%
+  filter(natural_gas == 0) %>%
+  group_by(property_type) %>%
+  summarize(no_use_of_natural_gas = n())
+
+merged_data <- merge(no_use_of_natural_gas, total_count, by = "property_type", all.x = TRUE)
+merged_data$zero_ratio <- merged_data$no_use_of_natural_gas / merged_data$total_count
+
+top5_percent <- merged_data %>%
+  arrange(desc(zero_ratio))
+
+```
+
+
+
+```{r}
+## 2.2.2 electricity ##
+set.seed(123)
+
+## Regression Decision Tree Model##
+
+electricity <- characteristic_of_building %>%
+  select(-energy_use, -natural_gas) %>%
+  mutate(property_type = as.factor(property_type),
+         borough = as.factor(borough))
+
+indices <- sample(1:nrow(electricity), size = 0.7 * nrow(electricity))
+train_ele <- electricity[indices, ]
+test_ele <- electricity[-indices, ]
+
+tree_ele <- rpart(electricity ~ property_type + age + number_of_buildings + occupancy + borough, 
+                    data = train_ele, method = "anova")
+
+tree_plot_ele <- rpart.plot(tree_ele, box.palette="Orange")
+
+
+## Model Evaluation ##
+ele_predictions <- predict(tree_ele, test_ele)
+rmse <- sqrt(mean((ele_predictions - test_ele$electricity)^2))
+print(paste("RMSE:", rmse))
+
+rss <- sum((ele_predictions - mean(test_ele$electricity))^2)
+tss <- sum((test_ele$electricity - mean(test_ele$electricity))^2)
+r_squared <- rss / tss
+print(paste("R-squared:", r_squared))
+  
+
+##Understanding the Important Variables##
+var_importance_tree_ele <- vip::vip(tree_ele, num_features = 5)
+print(var_importance_tree_ele)
+  
+  
+```
+
+
+
+```{r}
+## 2.2.3 energy use ##
+set.seed(123)
+
+## Regression Decision Tree Model##
+energy_use <- characteristic_of_building %>%
+  select(-electricity, -natural_gas) %>%
+  mutate(property_type = as.factor(property_type),
+         borough = as.factor(borough))
+
+indices <- sample(1:nrow(energy_use), size = 0.7 * nrow(energy_use))
+train_energy <- energy_use[indices, ]
+test_energy <- energy_use[-indices, ]
+
+
+tree_energy <- rpart(energy_use ~ property_type + age + number_of_buildings + occupancy + borough, 
+                    data = train_energy, method = "anova")
+
+
+tree_plot_energy <- rpart.plot(tree_energy, box.palette="Orange")
+
+
+## Model Evaluation ##
+energy_predictions <- predict(tree_energy, test_energy)
+
+rmse <- sqrt(mean((energy_predictions - test_energy$energy_use)^2))
+print(paste("RMSE:", rmse))
+
+rss_en <- sum((energy_predictions - mean(test_energy$energy_use))^2)
+tss_en <- sum((test_energy$energy_use - mean(test_energy$energy_use))^2)
+r_squared_en <- 1 - rss_en / tss_en
+print(paste("R-squared:", r_squared_en))
+  
+##Understanding the Important Variables##
+var_importance_tree_energy <- vip(tree_energy, num_features = 5)
+print(var_importance_tree_energy)
+```
+
+
+
+```{r}
+## 2.3 spatial analysis##
+
+## get NYC map from Google Map ##
+
+api_key <- "AIzaSyCaOYQgXe5-u4Lb021NbEc1tc-c6WUgxVU"
+register_google(key = api_key)
+location <- c(lon = -74.0060, lat = 40.7128)  
+map <- tryCatch({
+  get_map(location = location, zoom = 10, maptype = 'roadmap')
+}, error = function(e) {
+  print(e)  
+})
+
+
+## visualization of natural gas ##
+average_natural_gas <- natural_gas %>%
+  group_by(borough) %>%
+  summarize(average_natural_gas = mean(natural_gas))
+
+borough_coords <- data.frame(
+  borough = c("Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"),
+  lat = c(40.7831, 40.8448, 40.6782, 40.7282, 40.5795),
+  lng = c(-73.9712, -73.8648, -73.9442, -73.7949, -74.1502)
+)
+
+borough_natural_gas <- merge(average_natural_gas, borough_coords, by = "borough")
+
+ggmap(map) +
+  geom_point(data = borough_natural_gas, aes(x = lng, y = lat, size = average_natural_gas, color = average_natural_gas), 
+             alpha = 0.7) +
+  scale_color_gradient(low = "green", high = "darkgreen") +
+  scale_size(range = c(5, 12), name = "Average Energy Use") +
+  ggtitle("Average Natural Gas Consumption by Borough in NYC") +
+  theme_minimal()
+
+```
+
+
+
+
+```{r}
+## visualization of energy use ##
+average_energy <- energy_use %>%
+  group_by(borough) %>%
+  summarize(average_energy = mean(energy_use))
+
+
+borough_energy <- merge(average_energy, borough_coords, by = "borough")
+
+ggmap(map) +
+  geom_point(data = borough_energy, aes(x = lng, y = lat, size = average_energy, color = average_energy), alpha = 0.7) +
+  scale_color_gradient(low = "orange3", high = "brown4") +
+  scale_size(range = c(5, 12), name = "Average Energy Use") +
+  ggtitle("Average Energy Usage by Borough in NYC") +
+  theme_minimal()
+```
+
+
+
+
+```{r}
+## visualization of electricity ##
+average_electricity <- electricity %>%
+  group_by(borough) %>%
+  summarize(average_electricity = mean(electricity))
+
+
+borough_electricity <- merge(average_electricity, borough_coords, by = "borough")
+
+ggmap(map) +
+  geom_point(data = borough_electricity, aes(x = lng, y = lat, size = average_electricity, color = average_electricity), 
+             alpha = 0.7) +
+  scale_color_gradient(low = "hotpink", high = "hotpink4") +
+  scale_size(range = c(5, 12), name = "Average Energy Use") +
+  ggtitle("Average Energy Usage by Borough in NYC") +
+  theme_minimal()
+```
+
+2.1: Importing & Cleaning the "training" data
+
+```{r}
+#Import data
+nyc_buildings <- read_csv("NYC_Building_Energy_and_Water_Data_Disclosure_for_Local_Law_84__2023-Present__20240411.csv")
+
+#Select relevant columns/variables
+ghg_data <- nyc_buildings %>%
+  select(`Property ID`,`NYC Borough, Block and Lot (BBL)`,
+`Primary Property Type - Portfolio Manager-Calculated`,
+`Total (Location-Based) GHG Emissions (Metric Tons CO2e)`,
+`Property GFA - Calculated (Buildings) (ft²)`) 
+
+#Get the boroughs
+ghg_data <- ghg_data %>% 
+  filter(substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 1 |
+           substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 2 |
+           substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) ==  3 |
+           substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 4 |
+           substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 5) %>% 
+    mutate(borough = case_when(
+      substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 1 ~ "Manhattan",
+      substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 2 ~ "Bronx",
+      substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 3 ~ "Brooklyn",
+      substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 4 ~ "Queens",
+      substr(`NYC Borough, Block and Lot (BBL)`, 1, 1) == 5 ~ "Staten Island")) %>% select(-`NYC Borough, Block and Lot (BBL)`) 
+
+
+#Specify the property type
+ghg_data <- ghg_data %>% 
+  mutate(property_type = `Primary Property Type - Portfolio Manager-Calculated`,
+    property_type = case_when(
+    property_type %in% c('Multifamily Housing', 'Other - Lodging/Residential', 
+                         'Residence Hall/Dormitory', 'Single-Family Home') ~ 'Residential',
+    property_type == 'Office' ~ 'Office Buildings',
+    property_type %in% c('Adult Education', 'College/University', 'K-12 School',
+                         'Data Center', 'Laboratory', 'Other - Education', 'Pre-school/Daycare',
+                         'Vocational School') ~ 'Educational Facilities',
+    property_type %in% c('Ambulatory Surgical Center', 'Hospital (General Medical & Surgical)',
+                         'Medical Office', 'Other - Specialty Hospital', 
+                         'Outpatient Rehabilitation/Physical Therapy',
+                         'Urgent Care/Clinic/Other Outpatient', 'Veterinary Office') ~ 'Hospitals and Health Facilities',
+    property_type %in% c('Automobile Dealership', 'Bank Branch', 'Enclosed Mall', 
+                         'Food Sales', 'Food Service', 'Other - Mall', 'Other - Recreation', 
+                         'Other - Restaurant/Bar', 'Residential Care Facility', 'Restaurant',
+                         'Repair Services (Vehicle, Shoe, Locksmith, etc.)', 'Retail Store', 
+                         'Strip Mall', 'Supermarket/Grocery Store', 'Wholesale Club/Supercenter') ~ 'Store Buildings',
+    property_type %in% c('Bar/Nightclub', 'Bowling Alley', 'Convention Center', 'Ice/Curling Rink',
+                         'Fitness Center/Health Club/Gym', 'Library', 'Lifestyle Center', 'Movie Theater', 
+                         'Museum', 'Other - Entertainment/Public Assembly', 'Performing Arts', 
+                         'Senior Living Community', 'Social/Meeting Hall', 
+                         'Personal Services (Health/Beauty, Dry Cleaning, etc.)') ~ 'Indoor Public Assembly Cultural Facilities',
+    property_type %in% c('Mailing Center/Post Office', 'Other', 'Mixed Use Property', 'Other - Utility',
+                         'Prison/Incarceration', 'Parking') ~ 'Misc Building Classifications',
+    property_type %in% c('Distribution Center', 'Non-Refrigerated Warehouse', 
+                         'Refrigerated Warehouse', 'Self-Storage Facility') ~ 'Warehouse',
+    property_type %in% c('Courthouse', 'Financial Office', 'Fire Station',   
+                         'Other - Public Services', 'Other - Services', 'Police Station') ~ 'Government City Departments',
+    property_type == 'Hotel' ~ 'Hotel',
+    property_type %in% c('Manufacturing/Industrial Plant', 'Other - Technology/Science', 
+                         'Wastewater Treatment Plant') ~ 'Factories and Industrial Buildings',
+    property_type %in% c('Stadium (Open)', 'Zoo') ~ 'Outdoor Recreational Facilities',
+    property_type == 'Transportation Terminal/Station' ~ 'Transportation',
+    property_type == 'Worship Facility' ~ 'Religious Facilities')
+    )  %>%
+  drop_na(property_type) %>% 
+  select(-`Primary Property Type - Portfolio Manager-Calculated`) 
+
+#Clean the GHG Emissions variable
+ghg_data <- ghg_data %>% 
+  mutate(ghg_emission = `Total (Location-Based) GHG Emissions (Metric Tons CO2e)`) %>% 
+  filter(ghg_emission != "Not Available") %>% 
+  filter(as.numeric(ghg_emission) > 0) %>% 
+  mutate(log_ghg_emission = log(as.numeric(ghg_emission))) %>% 
+  select(-`Total (Location-Based) GHG Emissions (Metric Tons CO2e)`, -ghg_emission)
+  
+#Property area variable
+ghg_data <- ghg_data %>% 
+  mutate(property_area = `Property GFA - Calculated (Buildings) (ft²)`) %>% 
+  select(-`Property GFA - Calculated (Buildings) (ft²)`)
+
+#Get rid of duplicates and prepare for modelling
+clean_energy_data <- ghg_data %>% 
+  mutate(borough = as.factor(borough),
+         property_type = as.factor(property_type))  %>% 
+  unique() %>% 
+  select(-`Property ID`)
+```
+
+
+2.2: Visualizing the data
+```{r}
+#Create Histogram of the log of the GHG Emissions 
+p <- ggplot(clean_energy_data, aes(x = log_ghg_emission)) +
+  geom_histogram(bins = 30) +
+  labs(x = "log(GHG Emission) (Metric Tons CO2e)",
+      y = "Number of properties (>50,000 square feet)")
+p
+
+```
+
+3. Importing & Cleaning the active construction data
+
+```{r}
+#Import data, takes about 5 minutes to load
+permit_data <- read_csv("DOB_Job_Application_Filings_20240501.csv")
+
+#Filter data to match the type of buildings as in energy data, only select relevant columns
+building_data <- permit_data %>% 
+  filter(`Job Type` == "NB",
+         `Proposed Zoning Sqft` > 50000) %>% 
+  select(BUILDING_CLASS, `Job #`, Borough, `Proposed Zoning Sqft`) %>% 
+  rename(property_type = BUILDING_CLASS,
+         job_number = `Job #`,
+         borough = Borough,
+         property_area = `Proposed Zoning Sqft`) 
+
+#Borough cleaning
+building_data <- building_data %>%
+  mutate(borough = str_to_title(borough)) 
+
+#Find property type
+building_data <- building_data %>%
+  mutate(property_type = case_when(
+    property_type %in% c('A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9', 'B1', 'B2', 'B3', 'B9', 'C0', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'CB', 'CC', 'CM', 'D0', 'D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8', 'D9', 'DB', 'DC', 'L1', 'L2', 'L3', 'L8', 'L9', 'N1', 'N2', 'N3', 'N4', 'N9', 'R1', 'R2', 'R3', 'R4', 'R6', 'R9', 'S0', 'S1', 'S2', 'S3', 'S4', 'S5', 'S9') ~ 'Residential',
+    property_type %in% c('E1', 'E2', 'E7', 'E9') ~ 'Warehouse',
+    property_type %in% c('F1', 'F2', 'F4', 'F5', 'F8', 'F9') ~ 'Factories and Industrial Buildings',
+     property_type %in% c('G1', 'G2', 'G3', 'G4', 'G5', 'G6', 'G7', 'G8', 'G9', 'GU', 'GW', 'J1', 'J2', 'J3', 'J4', 'J5', 'J6','J7', 'J8', 'J9', 'RA', 'RB', 'RG', 'RK', 'RP', 'RR', 'RS', 'RT', 'RW', 'R0', 'R5', 'U0', 'U1', 'U2', 'U3', 'U4', 'U5', 'U6', 'U7', 'U8', 'U9', 'V0', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7', 'V8', 'V9', 'Z0', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5', 'Z7', 'Z8', 'Z9') ~ 'Misc Building Classifications',
+    property_type %in% c('H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'H7', 'H8', 'H9', 'HB', 'HH', 'HR', 'HS', 'RH') ~ 'Hotel',
+    property_type %in% c('I1', 'I2', 'I3', 'I4', 'I5', 'I6', 'I7', 'I8', 'I9') ~ 'Hospitals and Health Facilities',
+    property_type %in% c('K1', 'K2', 'K3', 'K4', 'K5', 'K6', 'K7', 'K8', 'K9') ~ 'Store Buildings',
+    property_type %in% c('M1', 'M2', 'M3', 'M4', 'M9') ~ 'Religious Facilities',
+    property_type %in% c('O1', 'O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9') ~ 'Office Buildings',
+    property_type %in% c('P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8', 'P9') ~ 'Indoor Public Assembly Cultural Facilities',
+    property_type %in% c('Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6', 'Q7', 'Q8', 'Q9') ~ 'Outdoor Recreational Facilities',
+    property_type %in% c('T1', 'T2', 'T9') ~ 'Transportation',
+    property_type %in% c('W1', 'W2', 'W3', 'W4', 'W5', 'W6', 'W7', 'W8', 'W9') ~ 'Educational Facilities',
+    property_type %in% c('Y1', 'Y2', 'Y3', 'Y4', 'Y5', 'Y6', 'Y7', 'Y8', 'Y9') ~ 'Government City Departments'
+  )) %>% 
+  drop_na(property_type) 
+
+#Prepare for modelling
+clean_building_data <- building_data %>% 
+  mutate(property_type = as_factor(property_type), borough = as_factor(borough)) %>%
+  distinct() %>% 
+  select(-job_number)
+```
+
+4. Run Multiple Forest Regression
+
+```{r}
+#Run the model after doing a train-test split and predict values for the test 
+formula <- log_ghg_emission ~ .
+
+set.seed(123) 
+train_index <- sample(1:nrow(clean_energy_data), 0.8 * nrow(clean_energy_data))
+train_data <- clean_energy_data[train_index, ]
+test_data <- clean_energy_data[-train_index, ]
+rf_model <- ranger(formula, data = train_data, num.trees = 2000, importance = 'impurity', mtry = 3, min.node.size = 2)
+
+predictions <- predict(rf_model, data = test_data)
+predicted_values <- predictions$predictions
+
+# Calculating RMSE
+actual_values <- test_data$log_ghg_emission
+rmse <- sqrt(mean((predicted_values - actual_values)^2))
+print(paste("RMSE:", rmse))
+
+# Calculating R-squared
+r_squared <- cor(predicted_values, actual_values)^2
+print(paste("R-squared:", r_squared))
+
+residuals <- actual_values - predicted_values
+
+# Plotting residuals vs. predicted values
+plot(predicted_values, residuals, xlab = "Predicted Values", ylab = "Residuals", main = "Residual Plot")
+```
+
+5.1. Predict ghg_emissions
+```{r}
+predictions_new <- predict(rf_model, data = clean_building_data)
+predicted_values_new <- predictions_new$predictions
+
+predicted_data <- clean_building_data %>% 
+  mutate(log_ghg_emission = predicted_values_new)
+```
+
+5.2. Visualize the new predictions of GHG Emissions
+```{r}
+#Plot the new data
+q <- ggplot(NULL, aes(x = predicted_values_new)) +
+  geom_histogram(bins = 30) +
+  labs(x = "Predicted log(GHG Emission) (Metric Tons CO2e)",
+      y = "Number of properties (>50,000 square feet)")
+q
+
+```
+5.3:
+Prediction conclusions:
+```{r}
+predicted_building_data <- clean_building_data %>% 
+  mutate(log_ghg_emission = predicted_values_new)
+
+#Calculate the mean of the log of GHG emissions across all property types, total and across boroughs
+mean_ghg <- mean(exp(clean_energy_data$log_ghg_emission))
+mean_ghg_pred <- mean(exp(predicted_building_data$log_ghg_emission))
+
+#Manhattan
+ghg_manhattan <- mean(exp(clean_energy_data$log_ghg_emission[clean_energy_data$borough == "Manhattan"]))
+ghg_manhattan_pred <- mean(exp(predicted_building_data$log_ghg_emission[predicted_building_data$borough == "Manhattan"]))
+
+#Brooklyn
+ghg_brook <- mean(exp(clean_energy_data$log_ghg_emission[clean_energy_data$borough == "Brooklyn"]))
+ghg_brook_pred <- mean(exp(predicted_building_data$log_ghg_emission[predicted_building_data$borough == "Brooklyn"]))
+
+#Queens
+ghg_queens <- mean(exp(clean_energy_data$log_ghg_emission[clean_energy_data$borough == "Queens"]))
+ghg_queens_pred <- mean(exp(predicted_building_data$log_ghg_emission[predicted_building_data$borough == "Queens"]))
+
+#Bronx
+ghg_bronx <- mean(exp(clean_energy_data$log_ghg_emission[clean_energy_data$borough == "Bronx"]))
+ghg_bronx_pred <- mean(exp(predicted_building_data$log_ghg_emission[predicted_building_data$borough == "Bronx"]))
+
+#SI
+ghg_si <- mean(exp(clean_energy_data$log_ghg_emission[clean_energy_data$borough == "Staten Island"]))
+ghg_si_pred <- mean(exp(predicted_building_data$log_ghg_emission[predicted_building_data$borough == "Staten Island"]))
+
+#Create dumbell plot
+average_values <- tibble(borough = c("Manhattan", 'Brooklyn', 'Queens', 'Bronx', 'Staten Island', 'Total'), current_value = c(ghg_manhattan, ghg_brook, ghg_queens, ghg_bronx, ghg_si, mean_ghg), pred_value = c(ghg_manhattan_pred,ghg_brook_pred, ghg_queens_pred, ghg_bronx_pred, ghg_si_pred, mean_ghg_pred))
+ggplot(average_values, aes(y = borough,
+                          x = current_value,
+                          xend = pred_value)) +  
+  geom_dumbbell(size = 1.2,
+                size_x = 3, 
+                size_xend = 3,
+                colour = "grey", 
+                colour_x = "red", 
+                colour_xend = "blue") +
+  theme_minimal() + 
+  labs(title = "Change in Average GHG Emissions in NYC",
+       x = "GHG Emissions (metric tons CO2e)",
+       y = "")
+```
+
+
+6. Spatial Analysis
+
+6.1: Of the existing data about GHG Emissions
+
+```{r}
+# spatial analysis
+
+county_ghg_1 <- clean_energy_data %>%
+  group_by(borough) %>%
+  summarise(average_ghg = mean(exp(log_ghg_emission)))
+
+borough_coords <- data.frame(
+  borough = c("Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"),
+  lat = c(40.7831, 40.8448, 40.6782, 40.7282, 40.5795),
+  lng = c(-73.9712, -73.8648, -73.9442, -73.7949, -74.1502)
+)
+
+nyc_counties_1 <- merge(county_ghg_1, borough_coords, by = "borough")
+
+r1 <- ggmap(NYCMap) +
+  geom_point(data = nyc_counties_1, aes(x = lng, y = lat, size = average_ghg, color = average_ghg), alpha = 0.7) +
+  scale_color_gradient(low = "hotpink", high = "hotpink4") +
+  scale_size(range = c(5, 12), name = "Average Energy Use") +
+  ggtitle("Average GHG Emissions per borough in NYC",
+          subtitle = "Data aggregated at borough level in existing buildings > 50,000 sqft ") +
+  theme_minimal()
+r1
+
+```
+6.2: Of the predicted GHG Emissions
+
+```{r}
+# spatial analysis
+county_ghg_2 <- predicted_data %>%
+  group_by(borough) %>%
+  summarise(average_ghg = mean(exp(log_ghg_emission)))
+
+borough_coords <- data.frame(
+  borough = c("Manhattan", "Bronx", "Brooklyn", "Queens", "Staten Island"),
+  lat = c(40.7831, 40.8448, 40.6782, 40.7282, 40.5795),
+  lng = c(-73.9712, -73.8648, -73.9442, -73.7949, -74.1502)
+)
+
+nyc_counties_2 <- merge(county_ghg_2, borough_coords, by = "borough")
+
+r2 <- ggmap(NYCMap) +
+  geom_point(data = nyc_counties_2, aes(x = lng, y = lat, size = average_ghg, color = average_ghg), alpha = 0.7) +
+  scale_color_gradient(low = "hotpink", high = "hotpink4") +
+  scale_size(range = c(5, 12), name = "Average Energy Use") +
+  ggtitle("Average GHG Emissions per borough in NYC",
+          subtitle = "Data aggregated at borough level in existing buildings > 50,000 sqft ") +
+  theme_minimal()
+
+r2
+```
+
+
+
+
