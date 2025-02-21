@@ -619,7 +619,7 @@ print(var_importance_tree_energy)
 
 ## get NYC map from Google Map ##
 
-api_key <- "AIzaSyCaOYQgXe5-u4Lb021NbEc1tc-c6WUgxVU"
+api_key <- "your_api_key"
 register_google(key = api_key)
 location <- c(lon = -74.0060, lat = 40.7128)  
 map <- tryCatch({
